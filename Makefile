@@ -8,3 +8,7 @@ chat: build-chat
 text-chat-race:
 	@go clean -testcache
 	@go test -race -v ./...
+
+text-chat:
+	@go clean -testcache
+	@go test -v ./...
