@@ -19,18 +19,35 @@ type MsgType string
 
 const (
 	MsgType_Broadcast MsgType = "broadcast"
+	MsgType_JoinRoom  MsgType = "join-room"
+	MsgType_LeaveRoom MsgType = "leave-room"
+	MsgType_RoomMsg   MsgType = "room-message"
 )
 
+type Room struct {
+	clients map[string]*Client
+	ID string
+}
+
+func NewRoom(id string) *Room {
+	return &Room{
+		ID: id,
+		clients: map[string]*Client{},
+	}
+} 
+
 type ReqMsg struct {
-	MsgType MsgType
+	MsgType MsgType `json:"type"`
 	Client  *Client
-	Data    string
+	Data    interface{} `json:"data"`
+	RoomID  string `json:"roomID"`
 }
 
 type RespMsg struct {
-	MsgType  MsgType
-	Data     string
-	SenderID string
+	MsgType  MsgType `json:"type"`
+	Data     interface{} `json:"data"`
+	SenderID string `json:"senderID"`
+	RoomID  string `json:"roomID"`
 }
 
 func NewRespMsg(msg *ReqMsg) *RespMsg {
@@ -38,6 +55,7 @@ func NewRespMsg(msg *ReqMsg) *RespMsg {
 		MsgType:  msg.MsgType,
 		Data:     msg.Data,
 		SenderID: msg.Client.ID,
+		RoomID: msg.RoomID,
 	}
 }
 
@@ -97,25 +115,44 @@ func (c *Client) readMsgLoop(srv *Server) {
 		}
 		msg.Client = c
 
-		srv.broadcastCH <- msg
+		switch msg.MsgType {
+		case MsgType_Broadcast:
+			srv.broadcastCH <- msg
+		case MsgType_JoinRoom:
+			srv.joinRoomCH <- msg
+		case MsgType_LeaveRoom:
+			srv.leaveRoomCH <- msg
+		case MsgType_RoomMsg:
+			srv.roomMsgCH <- msg
+		default: 
+			fmt.Printf("unknown msg type %s\n", msg.MsgType)
+		}
 	}
 }
 
 type Server struct {
 	clients       map[string]*Client
+	rooms          map[string]*Room
 	mu            *sync.RWMutex
 	joinServerCH  chan *Client
 	leaveServerCH chan *Client
 	broadcastCH   chan *ReqMsg
+	joinRoomCH    chan *ReqMsg
+	leaveRoomCH   chan *ReqMsg
+	roomMsgCH     chan *ReqMsg
 }
 
 func NewServer() *Server {
 	return &Server{
 		clients:       map[string]*Client{},
+		rooms:          map[string]*Room{},
 		mu:            new(sync.RWMutex),
 		joinServerCH:  make(chan *Client, 64),
 		leaveServerCH: make(chan *Client, 64),
 		broadcastCH:   make(chan *ReqMsg, 64),
+		joinRoomCH:    make(chan *ReqMsg, 64),
+		leaveRoomCH:   make(chan *ReqMsg, 64),
+		roomMsgCH:     make(chan *ReqMsg, 64),
 	}
 }
 
@@ -148,14 +185,14 @@ func (s *Server) AcceptLoop() {
 			s.joinServer(c)
 		case c := <-s.leaveServerCH:
 			s.leaveServer(c)
+		case msg := <-s.joinRoomCH:
+			s.joinRoom(msg)
+		case msg := <-s.leaveRoomCH:
+			s.leaveRoom(msg)
+		case msg := <-s.roomMsgCH:
+			s.roomMsg(msg)
 		case msg := <-s.broadcastCH:
-			cls := map[string]*Client{}
-			for id, c := range s.clients {
-				if id != msg.Client.ID {
-					cls[id] = c
-				}
-			}
-			go s.broadcast(msg, cls)
+			s.broadcast(msg)
 		}
 	}
 }
@@ -167,17 +204,87 @@ func (s *Server) joinServer(c *Client) {
 
 func (s *Server) leaveServer(c *Client) {
 	delete(s.clients, c.ID)
+
+	for _, r := range s.rooms {
+		_, ok := r.clients[c.ID]
+		if ok {
+			delete(r.clients, c.ID)
+		}
+	}
+
+
 	fmt.Printf("client left the server, cID = %s\n", c.ID)
 }
 
-func (s *Server) broadcast(msg *ReqMsg, cls map[string]*Client) {
+func (s *Server) broadcast(msg *ReqMsg) {
+	cls := map[string]*Client{}
+	for id, c := range s.clients {
+		if id != msg.Client.ID {
+			cls[id] = c
+		}
+	}
+
+	go s.sendMsg(msg, cls)
+	fmt.Println("broadcast was sent")
+}
+
+
+func (s *Server) roomMsg(msg *ReqMsg) {
+	rID := msg.RoomID
+	room, ok := s.rooms[rID]
+	if !ok {
+		fmt.Printf("the room does not exist -> cannot send msg into it")
+		return
+	}
+
+	_, ok = room.clients[msg.Client.ID]
+	if !ok {
+		fmt.Printf("the cleint = %s does not belong to the room %s -> cannot send msg into it\n", msg.Client.ID, rID)
+		return
+	}
+
+	cls := map[string]*Client{}
+	for id, c := range room.clients {
+		if id != msg.Client.ID {
+			cls[id] = c
+		}
+	}
+
+	go s.sendMsg(msg, cls)
+	fmt.Printf("the cleint = %s sent msg to the room %s\n", msg.Client.ID, rID)
+}
+
+func (s *Server) sendMsg(msg *ReqMsg, cls map[string]*Client) {
 	resp := NewRespMsg(msg)
 	for _, c := range cls {
 		c.msgCH <- resp
 	}
-
-	fmt.Println("broadcast was sent")
+	cls = nil
 }
+
+func (s *Server) joinRoom(msq *ReqMsg) {
+	rId := msq.RoomID
+	room, ok := s.rooms[rId]
+	if !ok {
+		room = NewRoom(rId)
+		s.rooms[rId] = room
+	}
+	room.clients[msq.Client.ID] = msq.Client
+	fmt.Printf("client joined the Room, cID = %s\n", rId)
+}
+
+func (s *Server) leaveRoom(msq *ReqMsg) {
+	rId := msq.RoomID
+	room, ok := s.rooms[rId]
+	if !ok {
+		fmt.Println("room does not exist",)
+		return
+	}
+
+	delete(room.clients, msq.Client.ID)
+	fmt.Printf("client left the Room, cID = %s\n", rId)
+}
+
 
 func createWSServer() {
 	s := NewServer()
