@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"sync"
+	"sync/atomic"
 
 	"github.com/gorilla/websocket"
 )
@@ -24,30 +25,18 @@ const (
 	MsgType_RoomMsg   MsgType = "room-message"
 )
 
-type Room struct {
-	clients map[string]*Client
-	ID string
-}
-
-func NewRoom(id string) *Room {
-	return &Room{
-		ID: id,
-		clients: map[string]*Client{},
-	}
-} 
-
 type ReqMsg struct {
 	MsgType MsgType `json:"type"`
 	Client  *Client
 	Data    interface{} `json:"data"`
-	RoomID  string `json:"roomID"`
+	RoomID  string      `json:"roomID"`
 }
 
 type RespMsg struct {
-	MsgType  MsgType `json:"type"`
+	MsgType  MsgType     `json:"type"`
 	Data     interface{} `json:"data"`
-	SenderID string `json:"senderID"`
-	RoomID  string `json:"roomID"`
+	SenderID string      `json:"senderID"`
+	RoomID   string      `json:"roomID"`
 }
 
 func NewRespMsg(msg *ReqMsg) *RespMsg {
@@ -55,7 +44,7 @@ func NewRespMsg(msg *ReqMsg) *RespMsg {
 		MsgType:  msg.MsgType,
 		Data:     msg.Data,
 		SenderID: msg.Client.ID,
-		RoomID: msg.RoomID,
+		RoomID:   msg.RoomID,
 	}
 }
 
@@ -124,15 +113,29 @@ func (c *Client) readMsgLoop(srv *Server) {
 			srv.leaveRoomCH <- msg
 		case MsgType_RoomMsg:
 			srv.roomMsgCH <- msg
-		default: 
-			fmt.Printf("unknown msg type %s\n", msg.MsgType)
+		default:
+			fmt.Println("unknown msg type -> ignoring it!")
 		}
+	}
+}
+
+type Room struct {
+	clients map[string]*Client
+	ID      string
+	clientsCount *atomic.Int64
+}
+
+func NewRoom(id string) *Room {
+	return &Room{
+		ID:           id,
+		clients:      map[string]*Client{},
+		clientsCount: new(atomic.Int64),
 	}
 }
 
 type Server struct {
 	clients       map[string]*Client
-	rooms          map[string]*Room
+	rooms         map[string]*Room
 	mu            *sync.RWMutex
 	joinServerCH  chan *Client
 	leaveServerCH chan *Client
@@ -140,12 +143,15 @@ type Server struct {
 	joinRoomCH    chan *ReqMsg
 	leaveRoomCH   chan *ReqMsg
 	roomMsgCH     chan *ReqMsg
+
+	reqCH         chan struct{}
+	clientCountCH chan int
 }
 
 func NewServer() *Server {
 	return &Server{
 		clients:       map[string]*Client{},
-		rooms:          map[string]*Room{},
+		rooms:         map[string]*Room{},
 		mu:            new(sync.RWMutex),
 		joinServerCH:  make(chan *Client, 64),
 		leaveServerCH: make(chan *Client, 64),
@@ -153,6 +159,8 @@ func NewServer() *Server {
 		joinRoomCH:    make(chan *ReqMsg, 64),
 		leaveRoomCH:   make(chan *ReqMsg, 64),
 		roomMsgCH:     make(chan *ReqMsg, 64),
+		reqCH:         make(chan struct{}),
+		clientCountCH: make(chan int),
 	}
 }
 
@@ -193,6 +201,8 @@ func (s *Server) AcceptLoop() {
 			s.roomMsg(msg)
 		case msg := <-s.broadcastCH:
 			s.broadcast(msg)
+		case <-s.reqCH:
+			s.clientCountCH <- len(s.clients)
 		}
 	}
 }
@@ -212,7 +222,6 @@ func (s *Server) leaveServer(c *Client) {
 		}
 	}
 
-
 	fmt.Printf("client left the server, cID = %s\n", c.ID)
 }
 
@@ -228,7 +237,6 @@ func (s *Server) broadcast(msg *ReqMsg) {
 	fmt.Println("broadcast was sent")
 }
 
-
 func (s *Server) roomMsg(msg *ReqMsg) {
 	rID := msg.RoomID
 	room, ok := s.rooms[rID]
@@ -241,6 +249,7 @@ func (s *Server) roomMsg(msg *ReqMsg) {
 	if !ok {
 		fmt.Printf("the cleint = %s does not belong to the room %s -> cannot send msg into it\n", msg.Client.ID, rID)
 		return
+
 	}
 
 	cls := map[string]*Client{}
@@ -262,32 +271,50 @@ func (s *Server) sendMsg(msg *ReqMsg, cls map[string]*Client) {
 	cls = nil
 }
 
-func (s *Server) joinRoom(msq *ReqMsg) {
-	rId := msq.RoomID
-	room, ok := s.rooms[rId]
+func (s *Server) joinRoom(msg *ReqMsg) {
+	rID := msg.RoomID
+	room, ok := s.rooms[rID]
 	if !ok {
-		room = NewRoom(rId)
-		s.rooms[rId] = room
+		room = NewRoom(rID)
+		s.rooms[rID] = room
 	}
-	room.clients[msq.Client.ID] = msq.Client
-	fmt.Printf("client joined the Room, cID = %s\n", rId)
+
+	room.clients[msg.Client.ID] = msg.Client
+	room.clientsCount.Add(1)
+	fmt.Printf("client joined the Room %s, cID = %s\n", rID, msg.Client.ID)
 }
 
-func (s *Server) leaveRoom(msq *ReqMsg) {
-	rId := msq.RoomID
-	room, ok := s.rooms[rId]
+func (s *Server) leaveRoom(msg *ReqMsg) {
+	rID := msg.RoomID
+	room, ok := s.rooms[rID]
 	if !ok {
-		fmt.Println("room does not exist",)
+		fmt.Printf("cannot leave room that does not exist rID = %s, cID = %s\n", rID, msg.Client.ID)
 		return
 	}
-
-	delete(room.clients, msq.Client.ID)
-	fmt.Printf("client left the Room, cID = %s\n", rId)
+	delete(room.clients, msg.Client.ID)
+	room.clientsCount.Add(-1)
+	fmt.Printf("client left the room rID = %s, cID = %s\n", rID, msg.Client.ID)
 }
 
+type TestRoomResults struct {
+	RoomID       string
+	ClientsCount int
+}
 
-func createWSServer() {
-	s := NewServer()
+func (s *Server) GetRoomTestResults(roomID string) *TestRoomResults {
+	room := s.rooms[roomID]
+	return &TestRoomResults{
+		RoomID:       roomID,
+		ClientsCount: int(room.clientsCount.Load()),
+	}
+}
+
+func (s *Server) GetServerTestResults() int {
+	s.reqCH <- struct{}{}
+	return <-s.clientCountCH
+}
+
+func (s *Server) createWSServer() {
 	go s.AcceptLoop()
 	http.HandleFunc("/", s.handleWS)
 
@@ -295,6 +322,8 @@ func createWSServer() {
 	log.Fatal(http.ListenAndServe(WSPort, nil))
 }
 
+
 func main() {
-	createWSServer()
+	s := NewServer()
+	s.createWSServer()
 }
