@@ -5,10 +5,18 @@ build-chat:
 chat: build-chat
 	@./bin/chat
 
-text-chat-race:
+test-chat-race:
 	@go clean -testcache
 	@go test -race -v ./...
+	
+test-conn-race:
+	@go clean -testcache
+	@go test -race -v -timeout 60s -run TestConnection .
 
-text-chat:
+test-rooms-race:
+	@go clean -testcache
+	@go test -race -v -timeout 60s -run TestRooms .
+	
+test-chat:
 	@go clean -testcache
 	@go test -v ./...
